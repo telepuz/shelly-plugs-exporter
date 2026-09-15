@@ -18,6 +18,7 @@ type Config struct {
 	Devices       []Device
 	ListenAddress string
 	ScrapeTimeout time.Duration
+	PollInterval  time.Duration
 }
 
 func Load() (*Config, error) {
@@ -48,9 +49,19 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("parsing SCRAPE_TIMEOUT: %w", err)
 	}
 
+	pollIntervalStr := os.Getenv("POLL_INTERVAL")
+	if pollIntervalStr == "" {
+		pollIntervalStr = "15s"
+	}
+	pollInterval, err := time.ParseDuration(pollIntervalStr)
+	if err != nil {
+		return nil, fmt.Errorf("parsing POLL_INTERVAL: %w", err)
+	}
+
 	return &Config{
 		Devices:       devices,
 		ListenAddress: listenAddress,
 		ScrapeTimeout: scrapeTimeout,
+		PollInterval:  pollInterval,
 	}, nil
 }

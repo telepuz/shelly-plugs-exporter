@@ -8,7 +8,8 @@ Prometheus exporter for Shelly PlugS Gen3 smart plugs.
 docker run -d \
   -e DEVICES='[{"name":"office","address":"192.168.1.100","username":"admin","password":"secret"}]' \
   -e LISTEN_ADDRESS=":9924" \
-  -e SCRAPE_TIMEOUT="30s" \
+  -e SCRAPE_TIMEOUT="10s" \
+  -e POLL_INTERVAL="15s" \
   -p 9924:9924 \
   t7k312/shelly-plugs-exporter:latest
 ```
@@ -19,7 +20,8 @@ docker run -d \
 |---|---|---|---|
 | `DEVICES` | - | yes | JSON array of device definitions (see format below) |
 | `LISTEN_ADDRESS` | `:9924` | no | Address and port for the HTTP server |
-| `SCRAPE_TIMEOUT` | `30s` | no | Per-device HTTP request timeout (Go duration format) |
+| `SCRAPE_TIMEOUT` | `10s` | no | Per-device HTTP request timeout per attempt (Go duration format) |
+| `POLL_INTERVAL` | `15s` | no | How often to poll each device in the background (Go duration format) |
 
 ## DEVICES format
 
@@ -59,9 +61,15 @@ scrape_configs:
           - localhost:9924
 ```
 
+## How it works
+
+Devices are polled in the background every `POLL_INTERVAL`. The `/metrics` endpoint always responds instantly from the in-memory cache - it never blocks on device HTTP calls.
+
+When a device is unreachable, `shelly_up` is set to 0 and all other metrics are set to 0. On transient network errors, the exporter retries up to 3 times before marking the device down.
+
 ## Metrics
 
-All metrics carry `device` and `address` labels.
+All metrics carry `device` and `address` labels. All metrics are always present - when a device is unreachable, values are 0.
 
 | Metric | Type | Description |
 |---|---|---|
@@ -106,7 +114,9 @@ spec:
             - name: LISTEN_ADDRESS
               value: ":9924"
             - name: SCRAPE_TIMEOUT
-              value: "30s"
+              value: "10s"
+            - name: POLL_INTERVAL
+              value: "15s"
           resources:
             requests:
               cpu: 10m

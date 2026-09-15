@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 )
 
@@ -144,5 +145,58 @@ func TestClient_ContextCancelled(t *testing.T) {
 	_, err := client.GetSwitchStatus(ctx)
 	if err == nil {
 		t.Fatal("expected error for cancelled context, got nil")
+	}
+}
+
+// TestClient_RetryOnNetworkError verifies that the client retries on network errors and
+// succeeds on the third attempt.
+func TestClient_RetryOnNetworkError(t *testing.T) {
+	var attempts atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := attempts.Add(1)
+		if n < 3 {
+			// Close connection abruptly to simulate a network error.
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("responsewriter does not support hijacking")
+				return
+			}
+			conn, _, _ := hj.Hijack()
+			conn.Close()
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(switchStatusResponse))
+	}))
+	defer srv.Close()
+
+	client := NewClient(stripScheme(srv.URL), "", "")
+	_, err := client.GetSwitchStatus(context.Background())
+	if err != nil {
+		t.Fatalf("expected success on third attempt, got error: %v", err)
+	}
+	if got := attempts.Load(); got != 3 {
+		t.Errorf("expected 3 attempts, got %d", got)
+	}
+}
+
+// TestClient_NoRetryOnHTTP500 verifies that the client does NOT retry on HTTP 5xx responses.
+func TestClient_NoRetryOnHTTP500(t *testing.T) {
+	var attempts atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	client := NewClient(stripScheme(srv.URL), "", "")
+	_, err := client.GetSwitchStatus(context.Background())
+	if err == nil {
+		t.Fatal("expected error for HTTP 500, got nil")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Errorf("expected exactly 1 attempt (no retry on HTTP 500), got %d", got)
 	}
 }

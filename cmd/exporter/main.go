@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 
@@ -21,10 +22,17 @@ func main() {
 		"listen", cfg.ListenAddress,
 		"devices", len(cfg.Devices),
 		"scrape_timeout", cfg.ScrapeTimeout,
+		"poll_interval", cfg.PollInterval,
 	)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := collector.New(cfg)
+	c.Start(ctx)
+
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(collector.New(cfg))
+	reg.MustRegister(c)
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))

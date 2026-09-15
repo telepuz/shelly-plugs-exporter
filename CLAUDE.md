@@ -11,15 +11,22 @@ Exporter exposes `/metrics` for Prometheus and `/healthz` for Kubernetes livenes
 ## Architecture
 
 ```
-ENV vars (DEVICES, LISTEN_ADDRESS, SCRAPE_TIMEOUT)
+ENV vars (DEVICES, LISTEN_ADDRESS, SCRAPE_TIMEOUT, POLL_INTERVAL)
      |
-main.go -> Collector (prometheus.Collector)
-              |
-              +-- per device: HTTP GET /rpc/Switch.GetStatus?id=0
-              +-- per device: HTTP GET /rpc/Sys.GetStatus
+main.go -> Collector.Start(ctx) -- background goroutine per device
+     |                                |
+     |                                +-- ticker(POLL_INTERVAL)
+     |                                +-- shelly.Client.GetSwitchStatus (with retry)
+     |                                +-- shelly.Client.GetSysStatus (with retry)
+     |                                +-- write to deviceCache (sync.RWMutex)
+     |
+     +-- /metrics -> Collector.Collect() -- reads deviceCache (no HTTP)
 ```
 
-Concurrent polling - one goroutine per device per scrape cycle (via `errgroup` or `sync.WaitGroup`).
+Background polling: one goroutine per device runs at POLL_INTERVAL. Initial poll happens immediately at Start().
+Collect() is non-blocking - reads cached state under RLock.
+
+When device unreachable: cache records up=0, all metric values=0. All metrics are still emitted (not skipped).
 
 ## Module name
 
@@ -70,7 +77,8 @@ Labels on all metrics: `device` (name from config), `address` (host).
 |-----|---------|----------|-------------|
 | `DEVICES` | - | yes | JSON array of devices |
 | `LISTEN_ADDRESS` | `:9924` | no | HTTP listen address |
-| `SCRAPE_TIMEOUT` | `10s` | no | Per-device HTTP timeout |
+| `SCRAPE_TIMEOUT` | `10s` | no | Per-device HTTP timeout (per attempt) |
+| `POLL_INTERVAL` | `15s` | no | Background polling interval per device |
 
 `DEVICES` example:
 ```json
