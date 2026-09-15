@@ -97,7 +97,7 @@ spec:
     spec:
       containers:
         - name: exporter
-          image: your-dockerhub-user/shelly-plugs-exporter:latest
+          image: t7k312/shelly-plugs-exporter:latest
           ports:
             - containerPort: 9924
           env:
