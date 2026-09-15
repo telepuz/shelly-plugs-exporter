@@ -66,23 +66,99 @@ var (
 	)
 )
 
-type deviceResult struct {
-	device       config.Device
+type deviceCache struct {
+	mu           sync.RWMutex
 	up           float64
-	switchStatus *shelly.SwitchStatus
-	sysStatus    *shelly.SysStatus
+	switchStatus shelly.SwitchStatus
+	sysStatus    shelly.SysStatus
 }
 
 type Collector struct {
 	devices       []config.Device
 	scrapeTimeout time.Duration
+	pollInterval  time.Duration
+	caches        []*deviceCache
 }
 
 func New(cfg *config.Config) *Collector {
+	caches := make([]*deviceCache, len(cfg.Devices))
+	for i := range caches {
+		caches[i] = &deviceCache{}
+	}
 	return &Collector{
 		devices:       cfg.Devices,
 		scrapeTimeout: cfg.ScrapeTimeout,
+		pollInterval:  cfg.PollInterval,
+		caches:        caches,
 	}
+}
+
+func (c *Collector) Start(ctx context.Context) {
+	for i := range c.devices {
+		go func(idx int) {
+			c.pollAndCache(ctx, idx)
+			ticker := time.NewTicker(c.pollInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					c.pollAndCache(ctx, idx)
+				}
+			}
+		}(i)
+	}
+}
+
+func (c *Collector) PollAll(ctx context.Context) {
+	var wg sync.WaitGroup
+	for i := range c.devices {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			c.pollAndCache(ctx, idx)
+		}(i)
+	}
+	wg.Wait()
+}
+
+func (c *Collector) pollAndCache(ctx context.Context, idx int) {
+	dev := c.devices[idx]
+	cache := c.caches[idx]
+
+	pollCtx, cancel := context.WithTimeout(ctx, c.scrapeTimeout)
+	defer cancel()
+
+	client := shelly.NewClient(dev.Address, dev.Username, dev.Password)
+
+	switchStatus, err := client.GetSwitchStatus(pollCtx)
+	if err != nil {
+		slog.Warn("failed to get switch status", "device", dev.Name, "address", dev.Address, "err", err)
+		cache.mu.Lock()
+		cache.up = 0
+		cache.switchStatus = shelly.SwitchStatus{}
+		cache.sysStatus = shelly.SysStatus{}
+		cache.mu.Unlock()
+		return
+	}
+
+	sysStatus, err := client.GetSysStatus(pollCtx)
+	if err != nil {
+		slog.Warn("failed to get sys status", "device", dev.Name, "address", dev.Address, "err", err)
+		cache.mu.Lock()
+		cache.up = 0
+		cache.switchStatus = shelly.SwitchStatus{}
+		cache.sysStatus = shelly.SysStatus{}
+		cache.mu.Unlock()
+		return
+	}
+
+	cache.mu.Lock()
+	cache.up = 1
+	cache.switchStatus = *switchStatus
+	cache.sysStatus = *sysStatus
+	cache.mu.Unlock()
 }
 
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
@@ -99,71 +175,31 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.scrapeTimeout)
-	defer cancel()
-
-	results := make([]deviceResult, len(c.devices))
-	var wg sync.WaitGroup
-
 	for i, dev := range c.devices {
-		wg.Add(1)
-		go func(idx int, d config.Device) {
-			defer wg.Done()
-			results[idx] = pollDevice(ctx, d)
-		}(i, dev)
-	}
-	wg.Wait()
+		name := dev.Name
+		addr := dev.Address
+		cache := c.caches[i]
 
-	for _, r := range results {
-		name := r.device.Name
-		addr := r.device.Address
+		cache.mu.RLock()
+		up := cache.up
+		ss := cache.switchStatus
+		sys := cache.sysStatus
+		cache.mu.RUnlock()
 
-		ch <- prometheus.MustNewConstMetric(descUp, prometheus.GaugeValue, r.up, name, addr)
+		ch <- prometheus.MustNewConstMetric(descUp, prometheus.GaugeValue, up, name, addr)
 
-		if r.up == 0 {
-			continue
+		switchOutput := 0.0
+		if ss.Output {
+			switchOutput = 1.0
 		}
-
-		if r.switchStatus != nil {
-			switchOutput := 0.0
-			if r.switchStatus.Output {
-				switchOutput = 1.0
-			}
-			ch <- prometheus.MustNewConstMetric(descSwitchOutput, prometheus.GaugeValue, switchOutput, name, addr)
-			ch <- prometheus.MustNewConstMetric(descActivePower, prometheus.GaugeValue, r.switchStatus.APower, name, addr)
-			ch <- prometheus.MustNewConstMetric(descVoltage, prometheus.GaugeValue, r.switchStatus.Voltage, name, addr)
-			ch <- prometheus.MustNewConstMetric(descFrequency, prometheus.GaugeValue, r.switchStatus.Freq, name, addr)
-			ch <- prometheus.MustNewConstMetric(descCurrent, prometheus.GaugeValue, r.switchStatus.Current, name, addr)
-			ch <- prometheus.MustNewConstMetric(descEnergyTotal, prometheus.GaugeValue, r.switchStatus.AEnergy.Total, name, addr)
-			ch <- prometheus.MustNewConstMetric(descReturnedEnergyTotal, prometheus.GaugeValue, r.switchStatus.RetAEnergy.Total, name, addr)
-			ch <- prometheus.MustNewConstMetric(descTemperature, prometheus.GaugeValue, r.switchStatus.Temperature.TC, name, addr)
-		}
-
-		if r.sysStatus != nil {
-			ch <- prometheus.MustNewConstMetric(descUptime, prometheus.GaugeValue, float64(r.sysStatus.Uptime), name, addr)
-		}
-	}
-}
-
-func pollDevice(ctx context.Context, dev config.Device) deviceResult {
-	client := shelly.NewClient(dev.Address, dev.Username, dev.Password)
-
-	switchStatus, err := client.GetSwitchStatus(ctx)
-	if err != nil {
-		slog.Warn("failed to get switch status", "device", dev.Name, "address", dev.Address, "err", err)
-		return deviceResult{device: dev, up: 0}
-	}
-
-	sysStatus, err := client.GetSysStatus(ctx)
-	if err != nil {
-		slog.Warn("failed to get sys status", "device", dev.Name, "address", dev.Address, "err", err)
-		return deviceResult{device: dev, up: 0}
-	}
-
-	return deviceResult{
-		device:       dev,
-		up:           1,
-		switchStatus: switchStatus,
-		sysStatus:    sysStatus,
+		ch <- prometheus.MustNewConstMetric(descSwitchOutput, prometheus.GaugeValue, switchOutput, name, addr)
+		ch <- prometheus.MustNewConstMetric(descActivePower, prometheus.GaugeValue, ss.APower, name, addr)
+		ch <- prometheus.MustNewConstMetric(descVoltage, prometheus.GaugeValue, ss.Voltage, name, addr)
+		ch <- prometheus.MustNewConstMetric(descFrequency, prometheus.GaugeValue, ss.Freq, name, addr)
+		ch <- prometheus.MustNewConstMetric(descCurrent, prometheus.GaugeValue, ss.Current, name, addr)
+		ch <- prometheus.MustNewConstMetric(descEnergyTotal, prometheus.GaugeValue, ss.AEnergy.Total, name, addr)
+		ch <- prometheus.MustNewConstMetric(descReturnedEnergyTotal, prometheus.GaugeValue, ss.RetAEnergy.Total, name, addr)
+		ch <- prometheus.MustNewConstMetric(descTemperature, prometheus.GaugeValue, ss.Temperature.TC, name, addr)
+		ch <- prometheus.MustNewConstMetric(descUptime, prometheus.GaugeValue, float64(sys.Uptime), name, addr)
 	}
 }

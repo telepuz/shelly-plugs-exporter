@@ -1,6 +1,7 @@
 package collector
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -131,6 +132,14 @@ func hasMetricForDevice(t *testing.T, reg *prometheus.Registry, metricName, devi
 	return false
 }
 
+func newTestConfig(devices []config.Device, timeout time.Duration) *config.Config {
+	return &config.Config{
+		Devices:       devices,
+		ScrapeTimeout: timeout,
+		PollInterval:  time.Minute,
+	}
+}
+
 // TestCollector_HappyPath verifies that all 10 metrics are emitted with correct values
 // when both Shelly API endpoints return valid data.
 func TestCollector_HappyPath(t *testing.T) {
@@ -138,11 +147,9 @@ func TestCollector_HappyPath(t *testing.T) {
 	defer srv.Close()
 
 	addr := hostPort(srv.URL)
-	cfg := &config.Config{
-		Devices:       []config.Device{{Name: "plug1", Address: addr}},
-		ScrapeTimeout: 5 * time.Second,
-	}
+	cfg := newTestConfig([]config.Device{{Name: "plug1", Address: addr}}, 5*time.Second)
 	c := New(cfg)
+	c.PollAll(context.Background())
 	reg := newRegistry(t, c)
 
 	// Verify total metric count: 10 metric families, each with 1 sample.
@@ -163,26 +170,21 @@ func TestCollector_HappyPath(t *testing.T) {
 	assertMetricValue(t, reg, "shelly_sys_uptime_seconds", 12345, "device", "plug1", "address", addr)
 }
 
-// TestCollector_DeviceUnreachable verifies that shelly_up=0 is emitted and no other
-// metrics are present when the device address is not reachable.
+// TestCollector_DeviceUnreachable verifies that shelly_up=0 is emitted and all other
+// metrics are also present with value 0 when the device address is not reachable.
 func TestCollector_DeviceUnreachable(t *testing.T) {
-	// Create a server then immediately close it so the address is invalid.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	addr := hostPort(srv.URL)
 	srv.Close()
 
-	cfg := &config.Config{
-		Devices:       []config.Device{{Name: "dead", Address: addr}},
-		ScrapeTimeout: 2 * time.Second,
-	}
+	cfg := newTestConfig([]config.Device{{Name: "dead", Address: addr}}, 2*time.Second)
 	c := New(cfg)
+	c.PollAll(context.Background())
 	reg := newRegistry(t, c)
 
 	assertMetricValue(t, reg, "shelly_up", 0, "device", "dead", "address", addr)
 
-	// No metrics other than shelly_up should be present for an unreachable device.
-	names := allMetricNames(t, reg)
-	unexpected := []string{
+	allExpected := []string{
 		"shelly_switch_output",
 		"shelly_active_power_watts",
 		"shelly_voltage_volts",
@@ -193,36 +195,50 @@ func TestCollector_DeviceUnreachable(t *testing.T) {
 		"shelly_temperature_celsius",
 		"shelly_sys_uptime_seconds",
 	}
-	for _, name := range unexpected {
-		if _, ok := names[name]; ok {
-			t.Errorf("metric %s should not be present when device is unreachable", name)
+	names := allMetricNames(t, reg)
+	for _, name := range allExpected {
+		if _, ok := names[name]; !ok {
+			t.Errorf("metric %s should be present (with value 0) when device is unreachable", name)
 		}
+		assertMetricValue(t, reg, name, 0, "device", "dead", "address", addr)
 	}
 }
 
-// TestCollector_HTTP500 verifies that shelly_up=0 when the device returns HTTP 500.
+// TestCollector_HTTP500 verifies that shelly_up=0 and all metrics with value 0 when the device returns HTTP 500.
 func TestCollector_HTTP500(t *testing.T) {
 	srv := newShellyServer(t, http.StatusInternalServerError, "", http.StatusInternalServerError, "")
 	defer srv.Close()
 
 	addr := hostPort(srv.URL)
-	cfg := &config.Config{
-		Devices:       []config.Device{{Name: "errdev", Address: addr}},
-		ScrapeTimeout: 5 * time.Second,
-	}
+	cfg := newTestConfig([]config.Device{{Name: "errdev", Address: addr}}, 5*time.Second)
 	c := New(cfg)
+	c.PollAll(context.Background())
 	reg := newRegistry(t, c)
 
 	assertMetricValue(t, reg, "shelly_up", 0, "device", "errdev", "address", addr)
 
 	names := allMetricNames(t, reg)
-	if _, ok := names["shelly_switch_output"]; ok {
-		t.Error("shelly_switch_output should not be present on HTTP 500")
+	allExpected := []string{
+		"shelly_switch_output",
+		"shelly_active_power_watts",
+		"shelly_voltage_volts",
+		"shelly_frequency_hz",
+		"shelly_current_amperes",
+		"shelly_energy_total_wh",
+		"shelly_returned_energy_total_wh",
+		"shelly_temperature_celsius",
+		"shelly_sys_uptime_seconds",
+	}
+	for _, name := range allExpected {
+		if _, ok := names[name]; !ok {
+			t.Errorf("metric %s should be present (with value 0) on HTTP 500", name)
+		}
+		assertMetricValue(t, reg, name, 0, "device", "errdev", "address", addr)
 	}
 }
 
 // TestCollector_PartialFailure verifies that when one of two devices fails,
-// the failing device has shelly_up=0 and no other metrics,
+// the failing device has shelly_up=0 and all metrics with value 0,
 // while the healthy device has all metrics with correct values.
 func TestCollector_PartialFailure(t *testing.T) {
 	goodSrv := newShellyServer(t, http.StatusOK, switchStatusJSON, http.StatusOK, sysStatusJSON)
@@ -234,14 +250,12 @@ func TestCollector_PartialFailure(t *testing.T) {
 
 	goodAddr := hostPort(goodSrv.URL)
 
-	cfg := &config.Config{
-		Devices: []config.Device{
-			{Name: "good", Address: goodAddr},
-			{Name: "bad", Address: badAddr},
-		},
-		ScrapeTimeout: 2 * time.Second,
-	}
+	cfg := newTestConfig([]config.Device{
+		{Name: "good", Address: goodAddr},
+		{Name: "bad", Address: badAddr},
+	}, 2*time.Second)
 	c := New(cfg)
+	c.PollAll(context.Background())
 	reg := newRegistry(t, c)
 
 	// Good device: shelly_up=1 and all metrics present.
@@ -250,10 +264,9 @@ func TestCollector_PartialFailure(t *testing.T) {
 	assertMetricValue(t, reg, "shelly_voltage_volts", 230.3, "device", "good", "address", goodAddr)
 	assertMetricValue(t, reg, "shelly_sys_uptime_seconds", 12345, "device", "good", "address", goodAddr)
 
-	// Bad device: shelly_up=0.
+	// Bad device: shelly_up=0 and all metrics present with value 0.
 	assertMetricValue(t, reg, "shelly_up", 0, "device", "bad", "address", badAddr)
 
-	// No detailed metrics should be present for the bad device.
 	detailedMetrics := []string{
 		"shelly_switch_output",
 		"shelly_active_power_watts",
@@ -266,18 +279,16 @@ func TestCollector_PartialFailure(t *testing.T) {
 		"shelly_sys_uptime_seconds",
 	}
 	for _, name := range detailedMetrics {
-		if hasMetricForDevice(t, reg, name, "bad") {
-			t.Errorf("metric %s should not be present for the failed device", name)
+		if !hasMetricForDevice(t, reg, name, "bad") {
+			t.Errorf("metric %s should be present (with value 0) for the failed device", name)
 		}
+		assertMetricValue(t, reg, name, 0, "device", "bad", "address", badAddr)
 	}
 }
 
 // TestCollector_Describe verifies that Describe sends all expected metric descriptors.
 func TestCollector_Describe(t *testing.T) {
-	cfg := &config.Config{
-		Devices:       []config.Device{{Name: "plug1", Address: "127.0.0.1:9999"}},
-		ScrapeTimeout: 5 * time.Second,
-	}
+	cfg := newTestConfig([]config.Device{{Name: "plug1", Address: "127.0.0.1:9999"}}, 5*time.Second)
 	c := New(cfg)
 
 	ch := make(chan *prometheus.Desc, 20)
@@ -300,12 +311,72 @@ func TestCollector_SwitchOutputOff(t *testing.T) {
 	defer srv.Close()
 
 	addr := hostPort(srv.URL)
-	cfg := &config.Config{
-		Devices:       []config.Device{{Name: "plug1", Address: addr}},
-		ScrapeTimeout: 5 * time.Second,
-	}
+	cfg := newTestConfig([]config.Device{{Name: "plug1", Address: addr}}, 5*time.Second)
 	c := New(cfg)
+	c.PollAll(context.Background())
 	reg := newRegistry(t, c)
 
 	assertMetricValue(t, reg, "shelly_switch_output", 0, "device", "plug1", "address", addr)
+}
+
+// TestCollector_CacheReturnedWhenDown verifies that after a working poll followed by a
+// failing poll, all metrics are present with value 0.
+func TestCollector_CacheReturnedWhenDown(t *testing.T) {
+	srv := newShellyServer(t, http.StatusOK, switchStatusJSON, http.StatusOK, sysStatusJSON)
+	addr := hostPort(srv.URL)
+
+	cfg := newTestConfig([]config.Device{{Name: "plug1", Address: addr}}, 2*time.Second)
+	c := New(cfg)
+
+	c.PollAll(context.Background())
+	reg := newRegistry(t, c)
+	assertMetricValue(t, reg, "shelly_up", 1, "device", "plug1", "address", addr)
+	assertMetricValue(t, reg, "shelly_active_power_watts", 106.3, "device", "plug1", "address", addr)
+
+	srv.Close()
+
+	c.PollAll(context.Background())
+
+	assertMetricValue(t, reg, "shelly_up", 0, "device", "plug1", "address", addr)
+	assertMetricValue(t, reg, "shelly_active_power_watts", 0, "device", "plug1", "address", addr)
+	assertMetricValue(t, reg, "shelly_voltage_volts", 0, "device", "plug1", "address", addr)
+	assertMetricValue(t, reg, "shelly_sys_uptime_seconds", 0, "device", "plug1", "address", addr)
+}
+
+// TestCollector_AllMetricsEmittedWhenDown verifies that a fresh collector with no polls
+// (cache up=0) emits all 10 metrics with value 0 after polling an unreachable device.
+func TestCollector_AllMetricsEmittedWhenDown(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	addr := hostPort(srv.URL)
+	srv.Close()
+
+	cfg := newTestConfig([]config.Device{{Name: "dead", Address: addr}}, 2*time.Second)
+	c := New(cfg)
+	c.PollAll(context.Background())
+	reg := newRegistry(t, c)
+
+	count := testutil.CollectAndCount(c)
+	if count != 10 {
+		t.Errorf("expected 10 metrics even when device is down, got %d", count)
+	}
+
+	allMetrics := []string{
+		"shelly_up",
+		"shelly_switch_output",
+		"shelly_active_power_watts",
+		"shelly_voltage_volts",
+		"shelly_frequency_hz",
+		"shelly_current_amperes",
+		"shelly_energy_total_wh",
+		"shelly_returned_energy_total_wh",
+		"shelly_temperature_celsius",
+		"shelly_sys_uptime_seconds",
+	}
+	names := allMetricNames(t, reg)
+	for _, name := range allMetrics {
+		if _, ok := names[name]; !ok {
+			t.Errorf("metric %s should be present with value 0 when device is down", name)
+		}
+		assertMetricValue(t, reg, name, 0, "device", "dead", "address", addr)
+	}
 }
